@@ -10,8 +10,13 @@ async function api(path, opts = {}) {
   const headers = opts.headers || {};
   const token = state.token;
   if (token) headers["Authorization"] = "Bearer " + token;
-  if (opts.json) { headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(opts.json); }
-  const res = await fetch(path, { ...opts, headers });
+  const { json, ...request } = opts;
+  if (json !== undefined) {
+    headers["Content-Type"] = "application/json";
+    request.method ??= "POST";
+    request.body = JSON.stringify(json);
+  }
+  const res = await fetch(path, { ...request, headers });
   if (res.status === 401) {
     if (!opts.signal?.aborted && token === state.token) logout();
     throw new Error("unauthorised");
