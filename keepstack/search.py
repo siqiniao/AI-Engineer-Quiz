@@ -6,8 +6,8 @@ Three complementary modes over one catalog:
   * filter   - faceted structured filters (media type, tag, status, dates)
   * semantic - embedding cosine ranking ("natural language" / more-like-this)
 
-Facet counts are returned alongside results so the UI can render a live,
-drill-down sidebar.
+Facet counts describe the catalog by status. The result total describes the
+current query.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ SORTS = {
 
 def _fts_query(q: str) -> str:
     """Turn user text into a safe FTS5 prefix query."""
-    terms = [t for t in "".join(c if c.isalnum() or c.isspace() else " " for c in q).split() if t]
+    terms = "".join(c if c.isalnum() or c.isspace() else " " for c in q).split()
     return " ".join(f'"{t}"*' for t in terms)
 
 
