@@ -6,6 +6,7 @@ single-page web client is served from the ``web/`` directory at the root.
 """
 from __future__ import annotations
 
+import csv
 import io
 import ipaddress
 import json
@@ -173,21 +174,42 @@ async def upload_assets(
     return {"created": results}
 
 
-@app.get("/api/assets")
-def list_assets(
+def asset_filters(
     q: str = "",
     media_type: Optional[str] = None,
     tag: Optional[str] = None,
-    collection_id: Optional[int] = None,
-    status: str = "active",
+    collection_id: Optional[int] = Query(None, ge=1, le=2**63 - 1),
+    include_tags: Optional[list[str]] = Query(None),
+    exclude_tags: Optional[list[str]] = Query(None),
     sort: str = "newest",
+):
+    return dict(q=q, media_type=media_type, tag=tag, collection_id=collection_id,
+                include_tags=tuple(include_tags or ()), exclude_tags=tuple(exclude_tags or ()),
+                sort=sort)
+
+
+@app.get("/api/assets")
+def list_assets(
+    filters: dict = Depends(asset_filters),
     mode: str = "keyword",
-    limit: int = Query(60, le=200),
-    offset: int = 0,
+    limit: int = Query(60, ge=1, le=200),
+    offset: int = Query(0, ge=0, le=2**63 - 1),
     user: dict = Depends(require_user),
 ):
-    return search.search(q=q, media_type=media_type, tag=tag, collection_id=collection_id,
-                         status=status, sort=sort, mode=mode, limit=limit, offset=offset)
+    return search.search(**filters, mode=mode, limit=limit, offset=offset)
+
+
+@app.get("/api/assets/export.csv")
+def export_assets(filters: dict = Depends(asset_filters), user: dict = Depends(require_user)):
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(search.CSV_FIELDS)
+    writer.writerows(search.export_rows(**filters))
+    return Response(
+        output.getvalue().encode("utf-8-sig"),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="assets.csv"'},
+    )
 
 
 def _get_asset_or_404(uuid: str) -> dict:
@@ -237,7 +259,7 @@ def update_asset(uuid: str, request: Request, body: dict = Body(...),
         vals.extend([now_iso(), a["id"]])
         with transaction() as conn:
             conn.execute(f"UPDATE assets SET {', '.join(sets)} WHERE id = ?", vals)
-        ingest.reindex_fts(a["id"])
+            ingest.reindex_fts(a["id"], conn=conn)
         ingest.reindex_embedding(a["id"])
         log("asset.update", user=user, target_type="asset", target_id=uuid,
             detail=",".join(body.keys()), ip=client_ip(request))
@@ -301,7 +323,7 @@ def add_tag(uuid: str, request: Request, body: dict = Body(...),
         tid = conn.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()["id"]
         conn.execute("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id, source) VALUES (?,?,?)",
                      (a["id"], tid, "manual"))
-    ingest.reindex_fts(a["id"])
+        ingest.reindex_fts(a["id"], conn=conn)
     ingest.reindex_embedding(a["id"])
     log("tag.add", user=user, target_type="asset", target_id=uuid, detail=name)
     return {"ok": True}
@@ -314,7 +336,7 @@ def remove_tag(uuid: str, name: str, user: dict = Depends(require_role("contribu
         conn.execute(
             "DELETE FROM asset_tags WHERE asset_id = ? AND tag_id = "
             "(SELECT id FROM tags WHERE name = ?)", (a["id"], name.lower()))
-    ingest.reindex_fts(a["id"])
+        ingest.reindex_fts(a["id"], conn=conn)
     return {"ok": True}
 
 

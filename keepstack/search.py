@@ -11,6 +11,7 @@ drill-down sidebar.
 """
 from __future__ import annotations
 
+import json
 from typing import Optional
 
 from . import ai
@@ -36,6 +37,8 @@ def search(
     media_type: Optional[str] = None,
     tag: Optional[str] = None,
     collection_id: Optional[int] = None,
+    include_tags: tuple[str, ...] = (),
+    exclude_tags: tuple[str, ...] = (),
     status: str = "active",
     sort: str = "newest",
     mode: str = "keyword",
@@ -48,44 +51,81 @@ def search(
     if mode == "semantic" and q.strip():
         return _semantic_search(q, media_type, status, limit, offset)
 
-    where = ["a.status = ?"]
-    params: list = [status]
-    join = ""
-
-    if q.strip():
-        join += " JOIN asset_fts f ON f.rowid = a.id"
-        where.append("asset_fts MATCH ?")
-        params.append(_fts_query(q))
-    if media_type:
-        where.append("a.media_type = ?")
-        params.append(media_type)
-    if tag:
-        join += (" JOIN asset_tags at ON at.asset_id = a.id"
-                 " JOIN tags t ON t.id = at.tag_id AND t.name = ?")
-        params.append(tag.lower())
-    if collection_id:
-        join += " JOIN collection_assets ca ON ca.asset_id = a.id AND ca.collection_id = ?"
-        params.append(collection_id)
-
-    where_sql = " AND ".join(where)
-    order = "bm25(asset_fts)" if q.strip() else SORTS.get(sort, SORTS["newest"])
-
-    total = conn.execute(
-        f"SELECT COUNT(*) AS c FROM assets a{join} WHERE {where_sql}", params
-    ).fetchone()["c"]
-
+    source, params, order = _keyword_query(
+        q=q, media_type=media_type, tag=tag, collection_id=collection_id,
+        include_tags=include_tags, exclude_tags=exclude_tags, status=status, sort=sort,
+    )
+    total = conn.execute(f"SELECT COUNT(*) AS c {source}", params).fetchone()["c"]
     rows = conn.execute(
-        f"""SELECT a.* FROM assets a{join} WHERE {where_sql}
-            ORDER BY {order} LIMIT ? OFFSET ?""",
+        f"SELECT a.* {source} ORDER BY {order} LIMIT ? OFFSET ?",
         [*params, limit, offset],
-    ).fetchall()
-
+    )
     return {
         "total": total,
         "items": [_card(dict(r)) for r in rows],
         "facets": _facets(status),
         "mode": mode,
     }
+
+
+def _keyword_query(
+    *, q="", media_type=None, tag=None, collection_id=None,
+    include_tags=(), exclude_tags=(), status="active", sort="newest",
+):
+    """Build the shared SQL source and ordering for the list and export."""
+    where = ["a.status = ?"]
+    params = [status]
+    source = "FROM assets a"
+    if q.strip():
+        expression = _fts_query(q)
+        if expression:
+            source += " JOIN asset_fts ON asset_fts.rowid = a.id"
+            where.append("asset_fts MATCH ?")
+            params.append(expression)
+        else:
+            where.append("0")
+    if media_type:
+        where.append("a.media_type = ?")
+        params.append(media_type)
+    if collection_id is not None:
+        where.append("""EXISTS (SELECT 1 FROM collection_assets ca
+                                WHERE ca.asset_id = a.id AND ca.collection_id = ?)""")
+        params.append(collection_id)
+
+    included = {name.strip().lower() for name in (*include_tags, tag or "") if name.strip()}
+    excluded = {name.strip().lower() for name in exclude_tags if name.strip()}
+    if included & excluded:
+        where.append("0")
+    else:
+        matching_tags = """
+            FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+            WHERE at.asset_id = a.id AND t.name IN (SELECT value FROM json_each(?))
+        """
+        if included:
+            where.append(f"(SELECT COUNT(*) {matching_tags}) = ?")
+            params.extend([json.dumps(sorted(included)), len(included)])
+        if excluded:
+            where.append(f"NOT EXISTS (SELECT 1 {matching_tags})")
+            params.append(json.dumps(sorted(excluded)))
+
+    order = SORTS.get(sort, SORTS["newest"])
+    return f"{source} WHERE {' AND '.join(where)}", params, f"{order}, a.id ASC"
+
+
+CSV_FIELDS = ("uuid", "title", "description", "filename", "media_type", "tags", "created_at")
+
+
+def export_rows(**filters):
+    source, params, order = _keyword_query(**filters)
+    return get_conn().execute(
+        f"""SELECT a.uuid, a.title, a.description, a.filename, a.media_type,
+                   (SELECT json_group_array(name) FROM (
+                       SELECT t.name FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+                       WHERE at.asset_id = a.id ORDER BY t.name
+                   )) AS tags, a.created_at
+            {source} ORDER BY {order}""",
+        params,
+    )
 
 
 def _semantic_search(q, media_type, status, limit, offset) -> dict:

@@ -32,9 +32,13 @@ def _set_tags(conn, asset_id: int, tags: list[tuple[str, float]], source: str) -
         )
 
 
-def reindex_fts(asset_id: int) -> None:
-    """Rebuild the FTS row for an asset from its current state."""
-    conn = get_conn()
+def reindex_fts(asset_id: int, *, conn=None) -> None:
+    """Rebuild the FTS row, using the caller's transaction when supplied."""
+    if conn is None:
+        with transaction() as own_conn:
+            own_conn.execute("BEGIN IMMEDIATE")
+            reindex_fts(asset_id, conn=own_conn)
+        return
     a = conn.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
     if not a:
         return
@@ -61,7 +65,6 @@ def reindex_fts(asset_id: int) -> None:
             a["filename"] or "", " ".join(tags), meta_text, " ".join(custom),
         ),
     )
-    conn.commit()
 
 
 def reindex_embedding(asset_id: int) -> None:
