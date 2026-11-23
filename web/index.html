@@ -30,11 +30,7 @@
         <strong>Keepstack</strong>
       </div>
       <div class="search-box">
-        <input id="search" placeholder="Search assets, tags, metadata...">
-        <select id="search-mode" title="Search mode">
-          <option value="keyword">Keyword</option>
-          <option value="semantic">Semantic</option>
-        </select>
+        <input id="search" type="search" aria-label="Keyword" placeholder="Search assets, tags, metadata...">
       </div>
       <div class="topbar-right">
         <button id="btn-upload" class="btn btn-primary">Upload</button>
@@ -55,34 +51,46 @@
           <button class="nav-item admin-only" data-view="audit">Audit log</button>
         </nav>
 
-        <div id="facets" class="facets">
-          <div class="facet-group">
-            <h4>Media type</h4>
-            <ul id="facet-media"></ul>
-          </div>
-          <div class="facet-group">
-            <h4>Top tags</h4>
-            <ul id="facet-tags"></ul>
-          </div>
-        </div>
       </aside>
 
       <main class="content">
         <div id="view-library" class="view">
           <div class="view-head">
             <h2 id="result-title">Library</h2>
-            <div class="view-controls">
-              <span id="active-filter" class="chip hidden"></span>
-              <select id="sort">
-                <option value="newest">Newest</option>
-                <option value="oldest">Oldest</option>
+            <button id="export-csv" class="btn btn-primary" disabled>Export all matches as CSV</button>
+          </div>
+          <section class="library-filters" aria-label="Asset filters">
+            <div class="filter-fields">
+              <label>Collection<select id="filter-collection"><option value="">All collections</option></select></label>
+              <label>Media type<select id="filter-media"><option value="">All media types</option></select></label>
+              <label>Sort by<select id="sort">
+                <option value="newest">Created · newest first</option>
+                <option value="oldest">Created · oldest first</option>
                 <option value="name">Name</option>
                 <option value="largest">Largest</option>
-              </select>
+              </select></label>
             </div>
-          </div>
-          <div id="grid" class="grid"></div>
-          <div id="empty" class="empty hidden">No assets yet. Click Upload to get started.</div>
+            <div class="filter-fields">
+              <fieldset><legend>Include all of these tags</legend><div id="include-tags" class="tag-options"></div></fieldset>
+              <fieldset><legend>Exclude any of these tags</legend><div id="exclude-tags" class="tag-options"></div></fieldset>
+            </div>
+            <div class="filter-summary">
+              <span id="active-filter" class="muted"></span>
+              <button id="clear-filters" class="btn btn-ghost">Clear filters</button>
+            </div>
+            <div id="filter-error" class="hidden">
+              <span class="error" role="alert">Could not load collections or tags.</span>
+              <button id="retry-filters" class="btn">Retry</button>
+            </div>
+          </section>
+          <div id="library-status" class="empty" role="status"></div>
+          <button id="retry-library" class="btn hidden">Retry results</button>
+          <div id="grid" class="grid" aria-busy="false"></div>
+          <nav id="pagination" class="pagination" aria-label="Search result pages">
+            <button id="previous-page" class="btn" disabled>Previous</button>
+            <span id="page-number" class="muted"></span>
+            <button id="next-page" class="btn" disabled>Next</button>
+          </nav>
         </div>
 
         <div id="view-collections" class="view hidden">

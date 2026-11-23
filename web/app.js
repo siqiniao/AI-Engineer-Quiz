@@ -2,15 +2,20 @@
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const state = { token: localStorage.getItem("keepstack_token"), user: null,
-  q: "", mode: "keyword", media: null, tag: null, sort: "newest", collection: null };
+  q: "", media: "", sort: "newest", collection: "", page: 0,
+  includeTags: new Set(), excludeTags: new Set() };
 
 // ---------- API helper ----------
 async function api(path, opts = {}) {
   const headers = opts.headers || {};
-  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  const token = state.token;
+  if (token) headers["Authorization"] = "Bearer " + token;
   if (opts.json) { headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(opts.json); }
   const res = await fetch(path, { ...opts, headers });
-  if (res.status === 401) { logout(); throw new Error("unauthorised"); }
+  if (res.status === 401) {
+    if (!opts.signal?.aborted && token === state.token) logout();
+    throw new Error("unauthorised");
+  }
   if (!res.ok) { const t = await res.text(); throw new Error(t || res.statusText); }
   return res.headers.get("content-type")?.includes("json") ? res.json() : res;
 }
@@ -33,6 +38,9 @@ $("#login-form").addEventListener("submit", async (e) => {
 });
 $("#btn-logout").addEventListener("click", logout);
 function logout() { localStorage.removeItem("keepstack_token"); state.token = null; state.user = null;
+  clearTimeout(searchTimer);
+  libraryRequest?.abort();
+  optionsRequest?.abort();
   $("#app").classList.add("hidden"); $("#login").classList.remove("hidden"); }
 
 function enterApp() {
@@ -40,6 +48,8 @@ function enterApp() {
   $("#user-label").textContent = `${state.user.username} (${state.user.role})`;
   const isAdmin = state.user.role === "admin";
   $$(".admin-only").forEach(el => el.classList.toggle("hidden", !isAdmin));
+  loadFilterOptions();
+  updateFilterSummary();
   loadLibrary();
 }
 
@@ -49,7 +59,7 @@ $$(".nav-item").forEach(btn => btn.addEventListener("click", () => {
   const view = btn.dataset.view;
   $$(".view").forEach(v => v.classList.add("hidden"));
   $("#view-" + (view === "library" ? "library" : view)).classList.remove("hidden");
-  if (view === "library") loadLibrary();
+  if (view === "library") { loadFilterOptions(); loadLibrary(); }
   if (view === "collections") loadCollections();
   if (view === "dashboard") loadDashboard();
   if (view === "users") loadUsers();
@@ -57,46 +67,205 @@ $$(".nav-item").forEach(btn => btn.addEventListener("click", () => {
 }));
 
 // ---------- library / search ----------
+const PAGE_SIZE = 12;
 let searchTimer;
-$("#search").addEventListener("input", (e) => { state.q = e.target.value; clearTimeout(searchTimer); searchTimer = setTimeout(loadLibrary, 250); });
-$("#search-mode").addEventListener("change", (e) => { state.mode = e.target.value; loadLibrary(); });
-$("#sort").addEventListener("change", (e) => { state.sort = e.target.value; loadLibrary(); });
-$("#active-filter").addEventListener("click", () => { state.media = null; state.tag = null; state.collection = null; loadLibrary(); });
+let libraryRequest;
+let optionsRequest;
+let exporting = false;
+let resultsReady = false;
 
-async function loadLibrary() {
-  const p = new URLSearchParams({ q: state.q, sort: state.sort, mode: state.mode, limit: "120" });
-  if (state.media) p.set("media_type", state.media);
-  if (state.tag) p.set("tag", state.tag);
-  if (state.collection) p.set("collection_id", state.collection);
-  const data = await api("/api/assets?" + p.toString());
-  renderFacets(data.facets);
-  renderGrid(data.items, data.total);
-  const filt = state.media || (state.tag ? "#" + state.tag : null) || (state.collection ? "collection" : null);
-  $("#active-filter").classList.toggle("hidden", !filt);
-  if (filt) $("#active-filter").textContent = filt;
+function filterParams() {
+  const params = new URLSearchParams({ q: state.q, sort: state.sort });
+  if (state.media) params.set("media_type", state.media);
+  if (state.collection) params.set("collection_id", state.collection);
+  state.includeTags.forEach(tag => params.append("include_tags", tag));
+  state.excludeTags.forEach(tag => params.append("exclude_tags", tag));
+  return params;
 }
 
-function renderGrid(items, total) {
-  $("#result-title").textContent = state.q ? `Results (${total})` : `Library (${total})`;
-  $("#empty").classList.toggle("hidden", items.length > 0);
+function updateFilterSummary() {
+  const conditions = [];
+  if (state.q.trim()) conditions.push(`Keyword “${state.q.trim()}”`);
+  if (state.collection) conditions.push(`Collection: ${$("#filter-collection").selectedOptions[0]?.text || state.collection}`);
+  if (state.media) conditions.push(`Media type: ${state.media}`);
+  if (state.includeTags.size) conditions.push(`Include: ${[...state.includeTags].map(tag => JSON.stringify(tag)).join(", ")}`);
+  if (state.excludeTags.size) conditions.push(`Exclude: ${[...state.excludeTags].map(tag => JSON.stringify(tag)).join(", ")}`);
+  $("#active-filter").textContent = conditions.join(" · ") || "No filters applied";
+}
+
+function fillSelect(id, placeholder, options, selected, missingLabel = selected) {
+  const select = $(id);
+  const entries = options.map(({ value, label }) => new Option(label, value));
+  if (selected && !options.some(({ value }) => value === selected)) {
+    entries.push(new Option(missingLabel, selected));
+  }
+  select.replaceChildren(new Option(placeholder, ""), ...entries);
+  select.value = selected;
+}
+
+function renderTagOptions(id, names, selected) {
+  const labels = [...new Set([...names, ...selected])].map(name => {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = selected.has(name);
+    box.addEventListener("change", () => {
+      if (box.checked) selected.add(name);
+      else selected.delete(name);
+      changeFilters();
+    });
+    label.append(box, name);
+    return label;
+  });
+  $(id).replaceChildren(...(labels.length ? labels : ["No tags available"]));
+}
+
+async function loadFilterOptions() {
+  optionsRequest?.abort();
+  const request = new AbortController();
+  optionsRequest = request;
+  $("#filter-error").classList.add("hidden");
+  try {
+    const [collections, tags] = await Promise.all([
+      api("/api/collections", { signal: request.signal }),
+      api("/api/tags", { signal: request.signal }),
+    ]);
+    if (request.signal.aborted) return;
+    fillSelect("#filter-collection", "All collections", collections.collections.map(c => ({
+      value: String(c.id), label: c.name,
+    })), state.collection, `Collection #${state.collection}`);
+    const names = tags.tags.map(tag => tag.name);
+    renderTagOptions("#include-tags", names, state.includeTags);
+    renderTagOptions("#exclude-tags", names, state.excludeTags);
+    updateFilterSummary();
+  } catch {
+    if (!request.signal.aborted) $("#filter-error").classList.remove("hidden");
+  }
+}
+
+function updateExportButton() {
+  $("#export-csv").disabled = exporting || !resultsReady;
+  $("#export-csv").textContent = exporting ? "Preparing CSV…" : "Export all matches as CSV";
+}
+
+function setLibraryLoading() {
+  resultsReady = false;
+  updateExportButton();
+  $("#grid").setAttribute("aria-busy", "true");
+  $("#grid").replaceChildren();
+  $("#library-status").textContent = "Loading assets…";
+  $("#library-status").classList.remove("hidden");
+  $("#result-title").textContent = "Library";
+  $("#retry-library").classList.add("hidden");
+  $("#page-number").textContent = "";
+  $("#previous-page").disabled = true;
+  $("#next-page").disabled = true;
+}
+
+function changeFilters(delay = false) {
+  state.page = 0;
+  clearTimeout(searchTimer);
+  libraryRequest?.abort();
+  updateFilterSummary();
+  if (delay) {
+    setLibraryLoading();
+    searchTimer = setTimeout(loadLibrary, 250);
+  } else {
+    loadLibrary();
+  }
+}
+
+async function loadLibrary() {
+  clearTimeout(searchTimer);
+  libraryRequest?.abort();
+  const request = new AbortController();
+  libraryRequest = request;
+  setLibraryLoading();
+  const params = filterParams();
+  params.set("limit", PAGE_SIZE);
+  params.set("offset", state.page * PAGE_SIZE);
+  try {
+    const data = await api("/api/assets?" + params, { signal: request.signal });
+    if (request.signal.aborted) return;
+    const pageCount = Math.ceil(data.total / PAGE_SIZE);
+    const lastPage = Math.max(0, pageCount - 1);
+    if (state.page > lastPage) {
+      state.page = lastPage;
+      return loadLibrary();
+    }
+    fillSelect("#filter-media", "All media types", data.facets.media_types.map(m => ({
+      value: m.value, label: m.value,
+    })), state.media);
+    renderGrid(data.items);
+    const matchText = `${data.total} matching ${data.total === 1 ? "asset" : "assets"}`;
+    $("#result-title").textContent = `Library · ${matchText}`;
+    $("#library-status").textContent = "No assets match the current filters.";
+    $("#library-status").classList.toggle("hidden", data.total > 0);
+    $("#page-number").textContent = pageCount ? `Page ${state.page + 1} of ${pageCount}` : "";
+    $("#previous-page").disabled = state.page === 0;
+    $("#next-page").disabled = state.page >= lastPage;
+    resultsReady = true;
+  } catch {
+    if (request.signal.aborted) return;
+    $("#library-status").textContent = "Could not load assets.";
+    $("#retry-library").classList.remove("hidden");
+  } finally {
+    if (!request.signal.aborted) {
+      $("#grid").setAttribute("aria-busy", "false");
+      updateExportButton();
+    }
+  }
+}
+
+$("#search").addEventListener("input", e => { state.q = e.target.value; changeFilters(true); });
+$("#sort").addEventListener("change", e => { state.sort = e.target.value; changeFilters(); });
+$("#filter-media").addEventListener("change", e => { state.media = e.target.value; changeFilters(); });
+$("#filter-collection").addEventListener("change", e => { state.collection = e.target.value; changeFilters(); });
+$("#retry-filters").addEventListener("click", loadFilterOptions);
+$("#retry-library").addEventListener("click", loadLibrary);
+$("#previous-page").addEventListener("click", () => { state.page--; loadLibrary(); });
+$("#next-page").addEventListener("click", () => { state.page++; loadLibrary(); });
+$("#clear-filters").addEventListener("click", () => {
+  state.q = $("#search").value = "";
+  state.media = $("#filter-media").value = "";
+  state.collection = $("#filter-collection").value = "";
+  state.includeTags.clear();
+  state.excludeTags.clear();
+  $$(".tag-options input").forEach(box => { box.checked = false; });
+  changeFilters();
+});
+
+$("#export-csv").addEventListener("click", async () => {
+  exporting = true;
+  updateExportButton();
+  try {
+    const response = await api("/api/assets/export.csv?" + filterParams());
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "assets.csv";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch {
+    toast("Could not download CSV. Try again.", "err");
+  } finally {
+    exporting = false;
+    updateExportButton();
+  }
+});
+
+function renderGrid(items) {
   $("#grid").innerHTML = items.map(a => `
     <div class="card" data-uuid="${a.uuid}">
       <img class="thumb" loading="lazy" src="/api/assets/${a.uuid}/thumb" alt="${esc(a.alt_text || a.title)}">
       <div class="meta">
         <span class="title" title="${esc(a.title)}">${esc(a.title)}</span>
-        <span class="sub"><span class="badge">${a.media_type}</span><span>${fmtBytes(a.size)}</span></span>
+        <span class="sub"><span class="badge">${esc(a.media_type)}</span><span>${fmtBytes(a.size)}</span></span>
       </div>
     </div>`).join("");
   $$("#grid .card").forEach(c => c.addEventListener("click", () => openAsset(c.dataset.uuid)));
-}
-
-function renderFacets(facets) {
-  $("#facet-media").innerHTML = (facets.media_types || []).map(m =>
-    `<li class="${state.media===m.value?'active':''}" data-media="${m.value}"><span>${m.value}</span><span class="count">${m.count}</span></li>`).join("");
-  $("#facet-tags").innerHTML = (facets.tags || []).slice(0, 18).map(t =>
-    `<li class="${state.tag===t.value?'active':''}" data-tag="${esc(t.value)}"><span>${esc(t.value)}</span><span class="count">${t.count}</span></li>`).join("");
-  $$("#facet-media li").forEach(li => li.addEventListener("click", () => { state.media = state.media===li.dataset.media?null:li.dataset.media; loadLibrary(); }));
-  $$("#facet-tags li").forEach(li => li.addEventListener("click", () => { state.tag = state.tag===li.dataset.tag?null:li.dataset.tag; loadLibrary(); }));
 }
 
 // ---------- asset detail drawer ----------
@@ -174,11 +343,15 @@ async function openAsset(uuid) {
       if (e.key === "Enter" && e.target.value.trim()) {
         await api("/api/assets/"+uuid+"/tags", { json: { name: e.target.value.trim() } });
         openAsset(uuid);
+        loadFilterOptions();
+        loadLibrary();
       }
     });
     $$("#tag-row .rm").forEach(rm => rm.addEventListener("click", async () => {
       await api("/api/assets/"+uuid+"/tags/"+encodeURIComponent(rm.dataset.tag), { method: "DELETE" });
       openAsset(uuid);
+      loadFilterOptions();
+      loadLibrary();
     }));
     $("#d-share")?.addEventListener("click", async () => {
       const r = await api("/api/shares", { json: { target_type: "asset", target_id: a.id, permission: "download" } });
@@ -196,7 +369,7 @@ async function openAsset(uuid) {
 // ---------- upload ----------
 const uploadModal = $("#upload-modal");
 $("#btn-upload").addEventListener("click", () => { uploadModal.classList.remove("hidden"); document.body.classList.add("modal-open"); });
-$("#upload-cancel").addEventListener("click", () => { uploadModal.classList.add("hidden"); document.body.classList.remove("modal-open"); loadLibrary(); });
+$("#upload-cancel").addEventListener("click", () => { uploadModal.classList.add("hidden"); document.body.classList.remove("modal-open"); loadFilterOptions(); loadLibrary(); });
 $(".modal-backdrop").addEventListener("click", () => { uploadModal.classList.add("hidden"); document.body.classList.remove("modal-open"); });
 const dz = $("#dropzone"), fileInput = $("#file-input");
 dz.addEventListener("click", () => fileInput.click());
@@ -228,11 +401,17 @@ async function loadCollections() {
     `<div class="collection-card" data-id="${c.id}"><span class="n">${esc(c.name)}</span><span class="muted">${c.asset_count} assets</span><span class="muted">${esc(c.description||"")}</span></div>`).join("")
     || '<p class="muted">No collections yet.</p>';
   $$("#collection-list .collection-card").forEach(card => card.addEventListener("click", () => {
-    state.collection = card.dataset.id; state.media = null; state.tag = null;
+    state.collection = card.dataset.id;
+    const select = $("#filter-collection");
+    if (![...select.options].some(option => option.value === state.collection)) {
+      select.add(new Option(card.querySelector(".n").textContent, state.collection));
+    }
+    select.value = state.collection;
     $$(".nav-item").forEach(b => b.classList.remove("active"));
     $('.nav-item[data-view="library"]').classList.add("active");
     $$(".view").forEach(v => v.classList.add("hidden")); $("#view-library").classList.remove("hidden");
-    loadLibrary();
+    loadFilterOptions();
+    changeFilters();
   }));
 }
 $("#btn-new-collection").addEventListener("click", async () => {
