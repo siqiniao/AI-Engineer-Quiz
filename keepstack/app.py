@@ -329,7 +329,8 @@ def add_tag(uuid: str, request: Request, body: dict = Body(...),
     return {"ok": True}
 
 
-@app.delete("/api/assets/{uuid}/tags/{name}")
+# ASGI decodes escaped slashes before routing, so the tag name can span segments.
+@app.delete("/api/assets/{uuid}/tags/{name:path}")
 def remove_tag(uuid: str, name: str, user: dict = Depends(require_role("contributor"))):
     a = _get_asset_or_404(uuid)
     with transaction() as conn:

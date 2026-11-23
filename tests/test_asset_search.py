@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import threading
+from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
@@ -155,6 +156,30 @@ def test_edits_update_fts_tag_filters_and_export(catalog):
     assert row["uuid"] == uuid and row["title"] == "Lighthouse"
     assert row["description"] == '新说明, "aftermarker"\nsecond line'
     assert json.loads(row["tags"]) == ["newcampaign"]
+
+
+def test_remove_slash_tag_updates_filters_fts_and_csv(catalog):
+    client, _, add = catalog
+    tag = "campaign/2026"
+    uuid = add("Harbor", ("approved", tag))
+    path = f"/api/assets/{uuid}"
+    queries = ({"include_tags": tag}, {"q": tag})
+
+    for params in queries:
+        assert [item["uuid"] for item in listed(client, params)["items"]] == [uuid]
+        row, = exported(client, params)
+        assert tag in json.loads(row["tags"])
+
+    # Match the asset drawer: encode the whole tag as a URL path parameter.
+    response = client.delete(f"{path}/tags/{quote(tag, safe='')}")
+    assert response.status_code == 200, response.text
+    assert [tag["name"] for tag in client.get(path).json()["tags"]] == ["approved"]
+
+    for params in queries:
+        assert listed(client, params)["total"] == 0
+        assert exported(client, params) == []
+    row, = exported(client, {"include_tags": "approved"})
+    assert json.loads(row["tags"]) == ["approved"]
 
 
 def test_empty_special_inputs_pagination_and_authentication(catalog):
